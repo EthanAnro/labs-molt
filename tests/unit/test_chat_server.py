@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -445,6 +446,37 @@ def test_run_turn_vlm_carries_pixel_values(monkeypatch):
     assert tp.calls[0][1] == {"image": ["PIL"]}  # images forwarded to generate as multi_modal_data
 
 
+def test_run_turn_loads_images_without_blocking_event_loop(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    timed_out = threading.Event()
+
+    def slow_load_images(url):
+        started.set()
+        if not release.wait(timeout=1):
+            timed_out.set()
+        return ["PIL"]
+
+    monkeypatch.setattr(cs, "load_images", slow_load_images)
+    _patch_prompts(monkeypatch, [[1, 2, 3]])
+    state, _ = _state([_act([90], [-0.1])])
+    state.open("sid", "P", "l", None)
+    body = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]}]}
+
+    async def run_turn():
+        task = asyncio.create_task(_run_turn(state, state.sessions["sid"], body))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        loop_remained_responsive = not timed_out.is_set()
+        release.set()
+        return await task, loop_remained_responsive
+
+    result, loop_remained_responsive = asyncio.run(run_turn())
+
+    assert result == ("ACT", "stop")
+    assert loop_remained_responsive
+
+
 def test_multiturn_vlm_carries_image_and_absorbs_a_new_one(monkeypatch):
     # The two multi-turn VLM cases geo3k (image only in turn 1) does NOT exercise: (1) turn 1's image
     # must PERSIST across a later text turn — pixel_values/budget kept, generation still gets mm_data;
@@ -482,12 +514,38 @@ def test_multiturn_vlm_carries_image_and_absorbs_a_new_one(monkeypatch):
     assert tp.calls[1][1] == {"image": ["PIL1"]}
 
     # turn 3: a NEW image mid-conversation -> accumulated into the one trajectory (both forwarded)
-    monkeypatch.setattr(cs, "load_images", lambda url: ["PIL2"])
+    started = threading.Event()
+    release = threading.Event()
+    timed_out = threading.Event()
+    new_image_loads = 0
+
+    def load_images(url):
+        nonlocal new_image_loads
+        if url == "u2":
+            new_image_loads += 1
+            if new_image_loads == 2:
+                started.set()
+                if not release.wait(timeout=1):
+                    timed_out.set()
+            return ["PIL2"]
+        return ["PIL1"]
+
+    monkeypatch.setattr(cs, "load_images", load_images)
     msgs = msgs + [
         {"role": "assistant", "content": "ACT"},
         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u2"}}]},
     ]
-    _drive(state, session, msgs)
+
+    async def run_image_turn():
+        task = asyncio.create_task(_run_turn(state, session, {"messages": msgs}))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        loop_remained_responsive = not timed_out.is_set()
+        release.set()
+        await task
+        return loop_remained_responsive
+
+    assert asyncio.run(run_image_turn())
     assert traj.pil_images == ["PIL1", "PIL2"] and traj.mm_train_inputs["pixel_values"].shape[0] == 2
     assert traj.image_budget == 10 and tp.calls[2][1] == {"image": ["PIL1", "PIL2"]}
     # token-exact across all 3 turns (image prompt + action + text delta + action + image delta + action)
