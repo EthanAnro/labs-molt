@@ -19,7 +19,9 @@ Covers the two-tier equivalence (string normalization + symbolic) and guards
 against over-counting. Run: python3 tests/unit/test_math_grader.py
 """
 
+import asyncio
 import importlib.util
+import threading
 from pathlib import Path
 
 _MG = Path(__file__).resolve().parents[2] / "examples" / "python" / "utils" / "math_grader.py"
@@ -68,6 +70,38 @@ NOMATCH = [
     ("36", "360"),
     ("1/3", "2/6"),  # unreduced fractions must match exactly
 ]
+
+
+def test_math_env_grading_keeps_event_loop_responsive(monkeypatch):
+    agent_path = Path(__file__).resolve().parents[2] / "examples" / "python" / "agents" / "math.py"
+    spec = importlib.util.spec_from_file_location("math_agent", agent_path)
+    agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent)
+
+    started = threading.Event()
+    release = threading.Event()
+    timed_out = threading.Event()
+
+    def slow_grader(*args):
+        started.set()
+        if not release.wait(timeout=1):
+            timed_out.set()
+        return {"reward": 1.0, "missing_answer": 0.0}
+
+    monkeypatch.setattr(agent._GRADER, "score_response", slow_grader)
+
+    async def run_step():
+        task = asyncio.create_task(agent.MathEnv().step({"action_text": "answer", "label": "1"}))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        loop_remained_responsive = not timed_out.is_set()
+        release.set()
+        return await task, loop_remained_responsive
+
+    result, loop_remained_responsive = asyncio.run(run_step())
+
+    assert result.reward.item() == 1.0
+    assert loop_remained_responsive
 
 
 def main() -> None:
